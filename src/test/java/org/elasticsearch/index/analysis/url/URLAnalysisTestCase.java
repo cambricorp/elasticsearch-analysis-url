@@ -8,6 +8,7 @@ import org.elasticsearch.test.StreamsUtils;
 import org.junit.Before;
 
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -16,11 +17,12 @@ import java.util.List;
  */
 public abstract class URLAnalysisTestCase extends ESIntegTestCase {
     protected static final String INDEX = "url_token_filter";
+    protected static final String TYPE = "test";
 
 
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
-        return pluginList(AnalysisURLPlugin.class);
+        return Collections.singletonList(AnalysisURLPlugin.class);
     }
 
     /**
@@ -32,7 +34,7 @@ public abstract class URLAnalysisTestCase extends ESIntegTestCase {
         super.setUp();
         String settings = StreamsUtils.copyToStringFromClasspath("/test-settings.json");
         String mapping = StreamsUtils.copyToStringFromClasspath("/test-mapping.json");
-        client().admin().indices().prepareCreate(INDEX).setSettings(settings).addMapping("test", mapping).get();
+        client().admin().indices().prepareCreate(INDEX).setSettings(settings).addMapping(TYPE, mapping).get();
         refresh();
         Thread.sleep(75);   // Ensure that the shard is available before we start making analyze requests.
     }

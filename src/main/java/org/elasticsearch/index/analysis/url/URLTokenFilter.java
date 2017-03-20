@@ -1,11 +1,12 @@
 package org.elasticsearch.index.analysis.url;
 
-import com.google.common.collect.ImmutableList;
 import org.apache.lucene.analysis.TokenFilter;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.path.PathHierarchyTokenizer;
 import org.apache.lucene.analysis.path.ReversePathHierarchyTokenizer;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
+import org.apache.lucene.analysis.tokenattributes.TypeAttribute;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.index.analysis.URLPart;
 
@@ -13,6 +14,7 @@ import java.io.IOException;
 import java.io.StringReader;
 import java.net.MalformedURLException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.regex.Matcher;
@@ -25,9 +27,9 @@ import java.util.regex.Pattern;
 public final class URLTokenFilter extends TokenFilter {
     public static final String NAME = "url";
 
-    private final URLPart part;
+    private List<URLPart> parts;
 
-    private final boolean urlDeocde;
+    private boolean urlDeocde;
 
     /**
      * If true, the url's host will be tokenized using a {@link ReversePathHierarchyTokenizer}
@@ -45,13 +47,17 @@ public final class URLTokenFilter extends TokenFilter {
     private boolean tokenizeQuery = true;
 
     private final CharTermAttribute termAttribute = addAttribute(CharTermAttribute.class);
+    private final TypeAttribute typeAttribute = addAttribute(TypeAttribute.class);
+    private final OffsetAttribute offsetAttribute = addAttribute(OffsetAttribute.class);
 
     private final boolean allowMalformed;
 
+    private boolean tokenizeMalformed;
+
     private boolean passthrough;
 
-    private List<String> tokens;
-    private Iterator<String> iterator;
+    private List<Token> tokens;
+    private Iterator<Token> iterator;
 
     public URLTokenFilter(TokenStream input, URLPart part) {
         this(input, part, false);
@@ -67,12 +73,21 @@ public final class URLTokenFilter extends TokenFilter {
 
     public URLTokenFilter(TokenStream input, URLPart part, boolean urlDecode, boolean allowMalformed, boolean passthrough) {
         super(input);
-        this.part = part;
+        if (part != null) {
+            this.parts = Collections.singletonList(part);
+        } else {
+            parts = null;
+        }
         this.urlDeocde = urlDecode;
         this.allowMalformed = allowMalformed;
         this.passthrough = passthrough;
     }
 
+
+    public URLTokenFilter setParts(List<URLPart> parts) {
+        this.parts = parts;
+        return this;
+    }
 
     public URLTokenFilter setTokenizeHost(boolean tokenizeHost) {
         this.tokenizeHost = tokenizeHost;
@@ -90,19 +105,29 @@ public final class URLTokenFilter extends TokenFilter {
     }
 
 
+    public URLTokenFilter setTokenizeMalformed(boolean tokenizeMalformed) {
+        this.tokenizeMalformed = tokenizeMalformed;
+        return this;
+    }
+
+    public URLTokenFilter setUrlDeocde(boolean urlDeocde) {
+        this.urlDeocde = urlDeocde;
+        return this;
+    }
+
+
     @Override
     public boolean incrementToken() throws IOException {
-        if(iterator == null || !iterator.hasNext()){
+        if (iterator == null || !iterator.hasNext()) {
             if ((iterator != null && !iterator.hasNext() && !passthrough) || !advance()) {
                 return false;
             }
         }
         clearAttributes();
-        String next = iterator.next();
-        if (allowMalformed) {
-            next = parseMalformed(next);
-        }
-        termAttribute.append(next);
+        Token next = iterator.next();
+        termAttribute.append(next.getToken());
+        typeAttribute.setType(next.getPart().name().toLowerCase());
+        offsetAttribute.setOffset(next.getStart(), next.getEnd());
         return true;
     }
 
@@ -123,12 +148,15 @@ public final class URLTokenFilter extends TokenFilter {
             } catch (IOException e) {
                 if (e.getMessage().contains("Malformed URL")) {
                     if (allowMalformed) {
-                        tokens = ImmutableList.of(urlString);
+                        tokens = Collections.singletonList(new Token(urlString, URLPart.WHOLE, 0, urlString.length()));
                     } else {
                         throw new MalformedURLException("Malformed URL: " + urlString);
                     }
                 }
                 throw e;
+            }
+            if (tokens.isEmpty()) {
+                return false;
             }
             iterator = tokens.iterator();
             return true;
@@ -145,18 +173,28 @@ public final class URLTokenFilter extends TokenFilter {
      * @return a list of tokens extracted from the input string
      * @throws IOException
      */
-    private List<String> tokenize(String input) throws IOException {
-        List<String> tokens = new ArrayList<>();
-        URLTokenizer tokenizer = new URLTokenizer(part);
+    private List<Token> tokenize(String input) throws IOException {
+        List<Token> tokens = new ArrayList<>();
+        URLTokenizer tokenizer = new URLTokenizer();
+        // create a copy of the parts list to avoid ConcurrentModificationException when sorting
+        tokenizer.setParts(new ArrayList<>(parts));
         tokenizer.setUrlDecode(urlDeocde);
         tokenizer.setTokenizeHost(tokenizeHost);
         tokenizer.setTokenizePath(tokenizePath);
         tokenizer.setTokenizeQuery(tokenizeQuery);
         tokenizer.setAllowMalformed(allowMalformed || passthrough);
+        tokenizer.setTokenizeMalformed(tokenizeMalformed);
         tokenizer.setReader(new StringReader(input));
         tokenizer.reset();
+
+        String term;
+        URLPart part;
+        OffsetAttribute offset;
         while (tokenizer.incrementToken()) {
-            tokens.add(tokenizer.getAttribute(CharTermAttribute.class).toString());
+            term = tokenizer.getAttribute(CharTermAttribute.class).toString();
+            part = URLPart.fromString(tokenizer.getAttribute(TypeAttribute.class).type());
+            offset = tokenizer.getAttribute(OffsetAttribute.class);
+            tokens.add(new Token(term, part, offset.startOffset(), offset.endOffset()));
         }
         return tokens;
     }
@@ -177,20 +215,34 @@ public final class URLTokenFilter extends TokenFilter {
      * Attempt to parse a malformed url string
      * @param urlString the malformed url string
      * @return the url part if it can be parsed, null otherwise
+     * @deprecated parsing of malformed URLs is now delegated to {@link URLTokenizer}
      */
     private String parseMalformed(String urlString) {
-        switch (part) {
-            case PROTOCOL:
-                return applyPattern(REGEX_PROTOCOL, urlString);
-            case PORT:
-                return applyPattern(REGEX_PORT, urlString);
-            case QUERY:
-                return applyPattern(REGEX_QUERY, urlString);
-            case WHOLE:
-                return urlString;
-            default:
-                return urlString;
+        if (parts != null && !parts.isEmpty()) {
+            String ret;
+            for (URLPart part : parts) {
+                switch (part) {
+                    case PROTOCOL:
+                        ret = applyPattern(REGEX_PROTOCOL, urlString);
+                        break;
+                    case PORT:
+                        ret = applyPattern(REGEX_PORT, urlString);
+                        break;
+                    case QUERY:
+                        ret = applyPattern(REGEX_QUERY, urlString);
+                        break;
+                    case WHOLE:
+                        ret = urlString;
+                        break;
+                    default:
+                        ret = urlString;
+                }
+                if (!Strings.isNullOrEmpty(ret)) {
+                    return ret;
+                }
+            }
         }
+        return urlString;
     }
 
     /**

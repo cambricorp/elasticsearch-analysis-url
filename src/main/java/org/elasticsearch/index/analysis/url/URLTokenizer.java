@@ -1,7 +1,7 @@
 package org.elasticsearch.index.analysis.url;
 
 import com.google.common.base.Strings;
-import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 import com.google.common.net.InetAddresses;
 import org.apache.lucene.analysis.Tokenizer;
 import org.apache.lucene.analysis.path.PathHierarchyTokenizer;
@@ -12,6 +12,7 @@ import org.apache.lucene.analysis.tokenattributes.OffsetAttribute;
 import org.apache.lucene.analysis.tokenattributes.TypeAttribute;
 import org.apache.lucene.util.AttributeFactory;
 import org.elasticsearch.index.analysis.URLPart;
+import org.elasticsearch.index.analysis.URLPartComparator;
 
 import java.io.IOException;
 import java.io.Reader;
@@ -19,25 +20,22 @@ import java.io.StringReader;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLDecoder;
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.List;
+import java.util.*;
 import java.util.regex.Pattern;
 
 import static org.elasticsearch.index.analysis.url.URLUtils.getPart;
-import static org.elasticsearch.index.analysis.url.URLUtils.getPort;
 
 /**
  * Joe Linn
  * 7/30/2015
  */
 public final class URLTokenizer extends Tokenizer {
-    public static final String NAME = "url";
+    private static final URLPartComparator PART_COMPARATOR = new URLPartComparator();
 
     /**
      * If set, only the given part of the url will be tokenized.
      */
-    private URLPart part;
+    private List<URLPart> parts;
 
     /**
      * If true, url parts will be url decoded prior to tokenization.
@@ -64,6 +62,12 @@ public final class URLTokenizer extends Tokenizer {
      */
     private boolean allowMalformed;
 
+    /**
+     * Has no effect if {@link #allowMalformed} is false. If both are true, an attempt will be made to tokenize malformed
+     * URLs using regular expressions.
+     */
+    private boolean tokenizeMalformed;
+
 
     private final CharTermAttribute termAttribute = addAttribute(CharTermAttribute.class);
     private final TypeAttribute typeAttribute = addAttribute(TypeAttribute.class);
@@ -78,7 +82,7 @@ public final class URLTokenizer extends Tokenizer {
     }
 
     public URLTokenizer(URLPart part) {
-        this.part = part;
+        setPart(part);
     }
 
 
@@ -86,8 +90,18 @@ public final class URLTokenizer extends Tokenizer {
         super(factory);
     }
 
+    public void setParts(List<URLPart> parts) {
+        if (parts != null) {
+            parts.sort(PART_COMPARATOR);
+            this.parts = parts;
+        }
+    }
 
-    public void setPart(URLPart part) { this.part = part; }
+    public void setPart(URLPart part) {
+        if (part != null) {
+            this.parts = Collections.singletonList(part);
+        }
+    }
 
     public void setUrlDecode(boolean urlDecode) { this.urlDecode = urlDecode; }
 
@@ -99,6 +113,7 @@ public final class URLTokenizer extends Tokenizer {
 
     public void setAllowMalformed(boolean allowMalformed) { this.allowMalformed = allowMalformed; }
 
+    public void setTokenizeMalformed(boolean tokenizeMalformed) { this.tokenizeMalformed = tokenizeMalformed; }
 
     @Override
     public boolean incrementToken() throws IOException {
@@ -157,23 +172,120 @@ public final class URLTokenizer extends Tokenizer {
     private List<Token> tokenize(String urlString) throws IOException {
         try {
             URL url = new URL(urlString);
-            if (part != null) {
-                // single URL part
-                return tokenize(url, part);
+            if (parts != null && !parts.isEmpty()) {
+                List<Token> tokensList = new ArrayList<>();
+                for (URLPart part : parts) {
+                    tokensList.addAll(tokenize(url, part));
+                }
+                return tokensList;
             }
             // No part is specified. Tokenize all parts.
-            List<Token> tokens = new ArrayList<>();
+            Set<Token> tokens = new LinkedHashSet<>();
             for (URLPart urlPart : URLPart.values()) {
                 tokens.addAll(tokenize(url, urlPart));
             }
             tokens.addAll(tokenizeSpecial(url));
-            return tokens;
+            return Lists.newArrayList(tokens);
         } catch (MalformedURLException e) {
             if (allowMalformed) {
-                return ImmutableList.of(new Token(urlString, URLPart.WHOLE, 0, urlString.length() - 1));
+                if (tokenizeMalformed && parts != null && !parts.isEmpty()) {
+                    return tokenizePartsMalformed(urlString, parts);
+                }
+                return tokenizeMalformed(urlString, (parts == null || parts.isEmpty()) ? null : URLPart.WHOLE);
             }
             throw new IOException("Malformed URL: " + urlString, e);
         }
+    }
+
+
+    /**
+     * Tokenize all given parts of the given URL while ensuring that duplicate tokens are not created when the whole
+     * malformed URL is is identical to a single part token.
+     * @param urlString the malformed URL to be tokenized
+     * @param parts the desired {@link URLPart}s in proper part order
+     * @return a list of {@link Token}s
+     * @throws IOException
+     */
+    private List<Token> tokenizePartsMalformed(String urlString, List<URLPart> parts) throws IOException {
+        List<Token> tokens = new ArrayList<>();
+        Set<String> tokenStrings = new HashSet<>();
+        for (URLPart part : parts) {
+            for (Token token : tokenizeMalformed(urlString, part)) {
+                if (part != URLPart.WHOLE) {
+                    tokens.add(token);
+                    tokenStrings.add(token.getToken());
+                } else if (tokenStrings.isEmpty()) {
+                    // If we couldn't tokenize any of the parts, add the whole thing.
+                    tokens.add(token);
+                }
+            }
+        }
+        return tokens;
+    }
+
+
+    /**
+     * Attempt to tokenize the given malformed URL.
+     * @param url the URL to be tokenized
+     * @param part the desired part of the URL
+     * @return {@link List} of {@link Token}s gleaned from the given URL
+     * @throws IOException
+     */
+    private List<Token> tokenizeMalformed(String url, URLPart part) throws IOException {
+        if (part == null) {
+            // No part is specified. Tokenize all parts.
+            List<URLPart> urlParts = Arrays.asList(URLPart.values());
+            urlParts.sort(new URLPartComparator());
+            return tokenizePartsMalformed(url, urlParts);
+        }
+        Optional<String> partOptional = getPart(url, part);
+        if (!partOptional.isPresent() || partOptional.get().equals("")) {
+            // desired part was not found
+            return new ArrayList<>();
+        }
+        final String partStringRaw = partOptional.get();
+        int start = 0;
+        int end = 0;
+        String partString = urlDecode(partOptional.get());
+        switch (part) {
+            case HOST:
+                return getHostTokens(url, partStringRaw, partString);
+            case PORT:
+                return getPortTokens(url, partStringRaw);
+            case PATH:
+                return getPathTokens(url, partStringRaw, partString);
+            case REF:
+                return getRefTokens(url, partStringRaw, partString);
+            case QUERY:
+                return getQueryTokens(url, partStringRaw, partString);
+            case PROTOCOL:
+                return Collections.singletonList(new Token(partString, part, start, partString.length()));
+            case WHOLE:
+                return Collections.singletonList(new Token(url, URLPart.WHOLE, 0, url.length() - 1));
+            default:
+        }
+        return Collections.singletonList(new Token(partString, part, start, end));
+    }
+
+
+    /**
+     * URL decode the given string if {@link #urlDecode} is true. The given <code>partString</code> is passed through
+     * unaltered otherwise.
+     * @param partString string to be URL decoded
+     * @return URL decoded string if {@link #urlDecode} is true; unaltered string otherwise.
+     * @throws IOException if malformed URL encoding is present and {@link #allowMalformed} is false.
+     */
+    private String urlDecode(String partString) throws IOException {
+        if (urlDecode) {
+            try {
+                partString = URLDecoder.decode(partString, "UTF-8");
+            } catch (IllegalArgumentException e) {
+                if (!allowMalformed) {
+                    throw new IOException("Error performing URL decoding on string: " + partString, e);
+                }
+            }
+        }
+        return partString;
     }
 
 
@@ -195,53 +307,118 @@ public final class URLTokenizer extends Tokenizer {
         final String partStringRaw = partString;
         int start = 0;
         int end = 0;
-        if (urlDecode) {
-            partString = URLDecoder.decode(partString, "UTF-8");
-        }
+        partString = urlDecode(partString);
         switch (part) {
             case HOST:
-                start = getStartIndex(url, partStringRaw);
-                if (!tokenizeHost || InetAddresses.isInetAddress(partString)) {
-                    end = getEndIndex(start, partStringRaw);
-                    return ImmutableList.of(new Token(partString, part, start, end));
-                }
-                return tokenize(part, addReader(new ReversePathHierarchyTokenizer('.', '.'), new StringReader(partString)), start);
+                return getHostTokens(url, partStringRaw, partString);
             case PORT:
-                String port = getPort(url);
-                start = url.toString().indexOf(":" + port);
-                if (start == -1) {
-                    // port was inferred
-                    start = 0;
-                } else {
-                    // explicit port
-                    start++;    // account for :
-                    end = getEndIndex(start, port);
-                }
-                return ImmutableList.of(new Token(port, part, start, end));
+                return getPortTokens(url, getPart(url, part));
             case PATH:
-                start = getStartIndex(url, partStringRaw);
-                if (!tokenizePath) {
-                    end = getEndIndex(start, partStringRaw);
-                    return ImmutableList.of(new Token(partString, part, start, end));
-                }
-                return tokenize(part, addReader(new PathHierarchyTokenizer('/', '/'), new StringReader(partString)), start);
+                return getPathTokens(url, partStringRaw, partString);
             case QUERY:
-                start = getStartIndex(url, partStringRaw);
-                if (!tokenizeQuery) {
-                    end = getEndIndex(start, partStringRaw);
-                    return ImmutableList.of(new Token(partString, part, start, end));
-                }
-                return tokenize(part, addReader(new PatternTokenizer(QUERY_SEPARATOR, -1), new StringReader(partString)), start);
+                return getQueryTokens(url, partStringRaw, partString);
             case PROTOCOL:
             case WHOLE:
                 end = partString.length();
                 break;
             case REF:
-                start = getStartIndex(url, "#" + partStringRaw) + 1;
-                end = url.toString().length();
+                return getRefTokens(url, partStringRaw, partString);
             default:
         }
-        return ImmutableList.of(new Token(partString, part, start, end));
+        return Collections.singletonList(new Token(partString, part, start, end));
+    }
+
+
+    /**
+     * Retrieve tokens representing the host of the given URL
+     * @param url URL to be tokenized
+     * @param partStringRaw raw (not url decoded) string containing the host
+     * @param partString potentially url decoded string containing the host
+     * @return host tokens
+     * @throws IOException
+     */
+    private List<Token> getHostTokens(URL url, String partStringRaw, String partString) throws IOException {
+        return getHostTokens(url.toString(), partStringRaw, partString);
+    }
+
+
+    /**
+     * Retrieve tokens representing the host of the given URL
+     * @param url URL to be tokenized
+     * @param partStringRaw raw (not url decoded) string containing the host
+     * @param partString potentially url decoded string containing the host
+     * @return host tokens
+     * @throws IOException
+     */
+    private List<Token> getHostTokens(String url, String partStringRaw, String partString) throws IOException {
+        int start = getStartIndex(url, partStringRaw);
+        if (!tokenizeHost || InetAddresses.isInetAddress(partString)) {
+            int end = getEndIndex(start, partStringRaw);
+            return Collections.singletonList(new Token(partString, URLPart.HOST, start, end));
+        }
+        return tokenize(URLPart.HOST, addReader(new ReversePathHierarchyTokenizer('.', '.'), new StringReader(partString)), start);
+    }
+
+
+    private List<Token> getPortTokens(URL url, String port) {
+        return getPortTokens(url.toString(), port);
+    }
+
+
+    private List<Token> getPortTokens(String url, String port) {
+        int start = url.indexOf(":" + port);
+        int end = 0;
+        if (start == -1) {
+            // port was inferred
+            start = 0;
+        } else {
+            // explicit port
+            start++;    // account for :
+            end = getEndIndex(start, port);
+        }
+        return Collections.singletonList(new Token(port, URLPart.PORT, start, end));
+    }
+
+
+    private List<Token> getPathTokens(URL url, String partStringRaw, String partString) throws IOException {
+        return getPathTokens(url.toString(), partStringRaw, partString);
+    }
+
+
+    private List<Token> getPathTokens(String url, String partStringRaw, String partString) throws IOException {
+        int start = getStartIndex(url, partStringRaw);
+        if (!tokenizePath) {
+            int end = getEndIndex(start, partStringRaw);
+            return Collections.singletonList(new Token(partString, URLPart.PATH, start, end));
+        }
+        return tokenize(URLPart.PATH, addReader(new PathHierarchyTokenizer('/', '/'), new StringReader(partString)), start);
+    }
+
+
+    private List<Token> getRefTokens(URL url, String partStringRaw, String partString) {
+        return getRefTokens(url.toString(), partStringRaw, partString);
+    }
+
+
+    private List<Token> getRefTokens(String url, String partStringRaw, String partString) {
+        int start = getStartIndex(url, "#" + partStringRaw) + 1;
+        int end = url.length();
+        return Collections.singletonList(new Token(partString, URLPart.REF, start, end));
+    }
+
+
+    private List<Token> getQueryTokens(URL url, String partStringRaw, String partString) throws IOException {
+        return getQueryTokens(url.toString(), partStringRaw, partString);
+    }
+
+
+    private List<Token> getQueryTokens(String url, String partStringRaw, String partString) throws IOException {
+        int start = getStartIndex(url, partStringRaw);
+        if (!tokenizeQuery) {
+            int end = getEndIndex(start, partStringRaw);
+            return Collections.singletonList(new Token(partString, URLPart.QUERY, start, end));
+        }
+        return tokenize(URLPart.QUERY, addReader(new PatternTokenizer(QUERY_SEPARATOR, -1), new StringReader(partString)), start);
     }
 
 
@@ -265,7 +442,12 @@ public final class URLTokenizer extends Tokenizer {
      * @return the starting index of the part string if it is found in the given url, -1 if it is not found
      */
     private int getStartIndex(URL url, String partStringRaw) {
-        return url.toString().indexOf(partStringRaw);
+        return getStartIndex(url.toString(), partStringRaw);
+    }
+
+
+    private int getStartIndex(String url, String partStringRaw) {
+        return url.indexOf(partStringRaw);
     }
 
 
@@ -307,7 +489,7 @@ public final class URLTokenizer extends Tokenizer {
      * @return a list of {@link Token}s. Since tokens created in this method do not pertain to a specific part of the url,
      * {@link URLPart#WHOLE} will be used.
      */
-    List<Token> tokenizeSpecial(URL url) {
+    private List<Token> tokenizeSpecial(URL url) {
         List<Token> tokens = new ArrayList<>();
         // host:port
         String token = getPart(url, URLPart.HOST) + ":" + getPart(url, URLPart.PORT);
@@ -330,25 +512,4 @@ public final class URLTokenizer extends Tokenizer {
     }
 
 
-    private class Token {
-        private final String token;
-        private final URLPart part;
-        private final int start;
-        private final int end;
-
-        public Token(String token, URLPart part, int start, int end) {
-            this.token = token;
-            this.part = part;
-            this.start = start;
-            this.end = end;
-        }
-
-        public String getToken() { return token; }
-
-        public URLPart getPart() { return part; }
-
-        public int getStart() { return start; }
-
-        public int getEnd() { return end; }
-    }
 }

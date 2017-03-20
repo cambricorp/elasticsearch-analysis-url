@@ -38,6 +38,14 @@
                     "analyzer": "url_port_malformed"
                 }
             }
+        },
+        "url_highlight_test": {
+            "type": "string",
+            "analyzer": "url_highlight_test"
+        },
+        "bulk_indexing_test": {
+            "type": "string",
+            "analyzer": "bulk_indexing_test"
         }
     }
 }

@@ -14,8 +14,26 @@
                 "part": "host",
                 "tokenize_host": false
             },
+            "url_protocol_and_host": {
+                "type": "url",
+                "part": ["protocol", "host"]
+            },
             "url_all": {
                 "type": "url"
+            },
+            "url_all_malformed": {
+                "type": "url",
+                "allow_malformed": true,
+                "tokenize_malformed": true
+            },
+            "url_highlight_test": {
+                "type": "url",
+                "url_decode": true,
+                "allow_malformed": true,
+                "tokenize_malformed": true,
+                "tokenize_host": true,
+                "tokenize_path": true,
+                "tokenize_query": true
             }
         },
         "filter": {
@@ -41,12 +59,20 @@
             "url_port_malformed": {
                 "type": "url",
                 "part": "port",
-                "allow_malformed": true
+                "allow_malformed": true,
+                "tokenize_malformed": true
             },
             "url_host_passthrough": {
                 "type": "url",
                 "part": "host",
                 "passthrough": "true"
+            },
+            "bulk_indexing_test": {
+                "type": "url",
+                "part": ["protocol", "host", "port", "path", "query", "ref"],
+                "url_decode": true,
+                "allow_malformed": true,
+                "tokenize_malformed": true
             }
         },
         "analyzer": {
@@ -95,8 +121,22 @@
             "tokenizer_url_host_single": {
                 "tokenizer": "url_host_single"
             },
+            "tokenizer_url_protocol_and_host": {
+                "tokenizer": "url_protocol_and_host"
+            },
             "tokenizer_url_all": {
                 "tokenizer": "url_all"
+            },
+            "tokenizer_url_all_malformed": {
+                "tokenizer": "url_all_malformed"
+            },
+            "url_highlight_test": {
+                "tokenizer": "url_highlight_test"
+            },
+            "bulk_indexing_test": {
+                "type": "custom",
+                "tokenizer": "whitespace",
+                "filter": ["bulk_indexing_test"]
             }
         }
     }

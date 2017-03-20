@@ -1,5 +1,6 @@
 package org.elasticsearch.index.analysis.url;
 
+import com.google.common.collect.Lists;
 import org.apache.lucene.analysis.BaseTokenStreamTestCase;
 import org.apache.lucene.analysis.TokenStream;
 import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
@@ -11,9 +12,9 @@ import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.List;
 
-import static org.elasticsearch.index.analysis.url.IsTokenizerWithTokenAndPosition.hasTokenAtOffset;
+import static org.elasticsearch.index.analysis.url.IsTokenStreamWithTokenAndPosition.hasTokenAtOffset;
 import static org.hamcrest.CoreMatchers.equalTo;
-import static org.hamcrest.CoreMatchers.hasItem;
+import static org.hamcrest.core.IsCollectionContaining.hasItem;
 
 /**
  * Joe Linn
@@ -84,6 +85,14 @@ public class URLTokenizerTest extends BaseTokenStreamTestCase {
 
 
     @Test
+    public void testTokenizeNoPath() throws Exception {
+        final String url = "http://www.foo.bar.com:9200";
+        URLTokenizer tokenizer = createTokenizer(url, URLPart.PATH);
+        assertTokenStreamContents(tokenizer, stringArray());
+    }
+
+
+    @Test
     public void testTokenizeQuery() throws IOException {
         URLTokenizer tokenizer = createTokenizer(TEST_HTTP_URL, URLPart.QUERY);
         assertTokenStreamContents(tokenizer, stringArray("foo=bar", "baz=bat"));
@@ -139,8 +148,139 @@ public class URLTokenizerTest extends BaseTokenStreamTestCase {
     }
 
 
-    private URLTokenizer createTokenizer(String input, URLPart part) throws IOException {
-        URLTokenizer tokenizer = new URLTokenizer(part);
+    @Test
+    public void testUrlDecode() throws Exception {
+        String url = "http://foo.com?baz=foo%20bat";
+        URLTokenizer tokenizer = createTokenizer(url, URLPart.QUERY);
+        tokenizer.setUrlDecode(true);
+        assertTokenStreamContents(tokenizer, stringArray("baz=foo bat"));
+    }
+
+
+    @Test(expected = IOException.class)
+    public void testUrlDecodeIllegalCharacters() throws Exception {
+        String url = "http://foo.com?baz=foo%2vbat";
+        URLTokenizer tokenizer = createTokenizer(url, URLPart.QUERY);
+        tokenizer.setUrlDecode(true);
+        assertTokenStreamContents(tokenizer, "");
+    }
+
+
+    @Test
+    public void testUrlDecodeAllowMalformed() throws Exception {
+        String url = "http://foo.com?baz=foo%2vbat";
+        URLTokenizer tokenizer = createTokenizer(url, URLPart.QUERY);
+        tokenizer.setUrlDecode(true);
+        tokenizer.setAllowMalformed(true);
+        assertTokenStreamContents(tokenizer, "baz=foo%2vbat");
+    }
+
+
+    @Test
+    public void testPartialUrl() throws Exception {
+        final String url = "http://";
+        URLTokenizer tokenizer = createTokenizer(url, URLPart.QUERY);
+        assertTokenStreamContents(tokenizer, new String[]{});
+    }
+
+
+    @Test
+    public void testNoProtocol() throws Exception {
+        final String url = "foo.bar.baz/bat/blah.html";
+        URLTokenizer tokenizer = createTokenizer(url, URLPart.PATH);
+        tokenizer.setAllowMalformed(true);
+        tokenizer.setTokenizeMalformed(true);
+        assertTokenStreamContents(tokenizer, stringArray("/bat", "/bat/blah.html"));
+    }
+
+
+    @Test
+    public void testMalformedGetRef() throws Exception {
+        String url = "/bat/blah.html#tag?baz=bat";
+        URLTokenizer tokenizer = createTokenizer(url, URLPart.REF);
+        tokenizer.setAllowMalformed(true);
+        tokenizer.setTokenizeMalformed(true);
+        assertTokenStreamContents(tokenizer, stringArray("tag"));
+    }
+
+
+    @Test
+    public void testMalformedWhole() throws Exception {
+        String url = "foo.bar.com/baz.html/query?a=1";
+        URLTokenizer tokenizer = createTokenizer(url, URLPart.WHOLE);
+        tokenizer.setAllowMalformed(true);
+        tokenizer.setTokenizeMalformed(true);
+        assertTokenStreamContents(tokenizer, stringArray("foo.bar.com/baz.html/query?a=1"));
+    }
+
+
+    @Test
+    public void testProtocolAndPort() throws Exception {
+        URLTokenizer tokenizer = createTokenizer(TEST_HTTP_URL, URLPart.PROTOCOL, URLPart.PORT);
+        assertTokenStreamContents(tokenizer, stringArray("http", "9200"));
+    }
+
+
+    @Test
+    public void testMalformedHostAndWhole() throws Exception {
+        URLTokenizer tokenizer = createTokenizer("example.com", URLPart.WHOLE, URLPart.HOST);
+        tokenizer.setAllowMalformed(true);
+        tokenizer.setTokenizeMalformed(true);
+        tokenizer.setTokenizeHost(false);
+        assertTokenStreamContents(tokenizer, stringArray("example.com"));
+    }
+
+
+    @Test
+    public void testTokenizeMalformedNoPartSpecified() throws Exception {
+        URLTokenizer tokenizer = createTokenizer("example.com");
+        tokenizer.setAllowMalformed(true);
+        tokenizer.setTokenizeMalformed(true);
+        tokenizer.setTokenizeHost(false);
+        assertTokenStreamContents(tokenizer, stringArray("example.com"));
+    }
+
+
+    @Test
+    public void testAllowMalformedNoPartsSpecified() throws Exception {
+        URLTokenizer tokenizer = createTokenizer("example.com");
+        tokenizer.setAllowMalformed(true);
+        tokenizer.setTokenizeHost(false);
+        assertTokenStreamContents(tokenizer, stringArray("example.com"));
+    }
+
+
+    @Test
+    public void testTokenizeSpecial() throws Exception {
+        final String url = "http://www.foo.bar.com:8080/baz/bat?bob=blah";
+        URLTokenizer tokenizer = createEverythingTokenizer(url);
+        assertThat(tokenizer, hasTokenAtOffset("www.foo.bar.com:8080", 7, 27));
+        tokenizer = createEverythingTokenizer(url);
+        assertThat(tokenizer, hasTokenAtOffset("www.foo.bar.com", 7, 22));
+        tokenizer = createEverythingTokenizer(url);
+        assertThat(tokenizer, hasTokenAtOffset("foo.bar.com", 11, 22));
+        tokenizer = createEverythingTokenizer(url);
+        assertThat(tokenizer, hasTokenAtOffset("bar.com", 15, 22));
+    }
+
+
+    private URLTokenizer createEverythingTokenizer(String input) throws IOException {
+        URLTokenizer tokenizer = createTokenizer(input);
+        tokenizer.setAllowMalformed(true);
+        tokenizer.setUrlDecode(true);
+        tokenizer.setTokenizeMalformed(true);
+        tokenizer.setTokenizeHost(true);
+        tokenizer.setTokenizePath(true);
+        tokenizer.setTokenizeQuery(true);
+        return tokenizer;
+    }
+
+
+    private URLTokenizer createTokenizer(String input, URLPart... parts) throws IOException {
+        URLTokenizer tokenizer = new URLTokenizer();
+        if (parts != null) {
+            tokenizer.setParts(Lists.newArrayList(parts));
+        }
         tokenizer.setReader(new StringReader(input));
         return tokenizer;
     }
